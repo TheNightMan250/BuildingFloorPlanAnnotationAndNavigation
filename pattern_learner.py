@@ -23,6 +23,7 @@ class PatternLearner:
         self.patterns = []  # List of training examples
         self.model_distance = None
         self.model_direction = None
+        self.model_size = None
         self.is_trained = False
         self.demo_mode = demo_mode
         self.performance_metrics = {
@@ -119,17 +120,20 @@ class PatternLearner:
         center_b = self.get_room_center(room_b)
         feature_distance = self.calculate_distance(center_a, center_b)
         feature_direction = self.calculate_direction(center_a, center_b)
+        feature_size = self.get_room_size(room_b)
         
         # Target: pattern from B->C (what we want to predict)
         center_c = self.get_room_center(room_c)
         target_distance = self.calculate_distance(center_b, center_c)
         target_direction = self.calculate_direction(center_b, center_c)
+        target_size = self.get_room_size(room_c)
         
         # Store pattern with consistent 2-feature structure
         pattern = {
-            "features": [feature_distance, feature_direction],  # Always 2 features
+            "features": [feature_distance, feature_direction, feature_size],
             "target_distance": target_distance,
             "target_direction": target_direction,
+            "target_size": target_size,
         }
         
         self.patterns.append(pattern)
@@ -173,26 +177,44 @@ class PatternLearner:
         X = []
         y_distance = []
         y_direction = []
+        y_size = []
+        has_any_size_target = False
         
         for pattern in self.patterns:
-            # Consistent 2-feature structure
-            X.append(pattern["features"])
+            feats = pattern.get("features")
+            if not isinstance(feats, list):
+                continue
+            if len(feats) == 2:
+                feats = [feats[0], feats[1], 0.0]
+            if len(feats) != 3:
+                continue
+
+            X.append(feats)
             y_distance.append(pattern["target_distance"])
             y_direction.append(pattern["target_direction"])
+
+            ts = pattern.get("target_size")
+            if ts is None:
+                y_size.append(0.0)
+            else:
+                y_size.append(ts)
+                has_any_size_target = True
         
         # Convert to numpy arrays
         X = np.array(X)
         y_distance = np.array(y_distance)
         y_direction = np.array(y_direction)
+        y_size = np.array(y_size)
+
+        if len(X) < 5:
+            self.is_trained = False
+            return
         
         # Train/test split for performance evaluation
         # Use proper split only when we have enough data for reliable metrics
         if len(X) >= 10:
-            X_train, X_test, y_dist_train, y_dist_test = train_test_split(
-                X, y_distance, test_size=0.2, random_state=42
-            )
-            _, _, y_dir_train, y_dir_test = train_test_split(
-                X, y_direction, test_size=0.2, random_state=42
+            X_train, X_test, y_dist_train, y_dist_test, y_dir_train, y_dir_test, y_size_train, y_size_test = train_test_split(
+                X, y_distance, y_direction, y_size, test_size=0.2, random_state=42
             )
             can_evaluate = True
         else:
@@ -201,6 +223,7 @@ class PatternLearner:
             X_train, X_test = X, X
             y_dist_train, y_dist_test = y_distance, y_distance
             y_dir_train, y_dir_test = y_direction, y_direction
+            y_size_train, y_size_test = y_size, y_size
             can_evaluate = False
         
         # Train regression models (not classification!)
@@ -219,6 +242,18 @@ class PatternLearner:
             min_samples_split=2
         )
         self.model_direction.fit(X_train, y_dir_train)
+
+        self.model_size = None
+        if has_any_size_target:
+            size_mask = np.array(y_size_train) > 0
+            if np.any(size_mask):
+                self.model_size = RandomForestRegressor(
+                    n_estimators=10,
+                    max_depth=5,
+                    random_state=42,
+                    min_samples_split=2,
+                )
+                self.model_size.fit(X_train[size_mask], np.array(y_size_train)[size_mask])
         
         # Calculate performance metrics (only if we have proper test set)
         if can_evaluate:
@@ -335,14 +370,21 @@ class PatternLearner:
             # Calculate input features (pattern from A->B)
             input_distance = self.calculate_distance(center_a, center_b)
             input_direction = self.calculate_direction(center_a, center_b)
+            input_size = self.get_room_size(room_b)
             
             # USE THE ACTUAL MODEL FOR PREDICTIONS
-            features = np.array([[input_distance, input_direction]])
+            features = np.array([[input_distance, input_direction, input_size]])
             
             # Validate if model predictions are reliable
             if self.should_use_model(features):
                 pred_distance = self.model_distance.predict(features)[0]
                 pred_direction = self.model_direction.predict(features)[0]
+                if self.model_size is not None:
+                    pred_size = float(self.model_size.predict(features)[0])
+                else:
+                    pred_size = float(input_size) if input_size > 0 else 0.0
+
+                confidence = self.get_prediction_confidence(features)
                 
                 # Generate suggestions from model predictions
                 suggestions = []
@@ -360,21 +402,32 @@ class PatternLearner:
                     
                     suggested_x = last_center[0] + dx
                     suggested_y = last_center[1] + dy
-                    
-                    suggestions.append((suggested_x, suggested_y))
+
+                    suggestions.append((suggested_x, suggested_y, "Room", float(confidence), float(max(0.0, pred_size))))
                 
                 return suggestions
             else:
                 # Model not reliable for this input, fall back to pattern continuation
-                return self.get_fallback_suggestions(previous_rooms, num_suggestions)
+                fallback = self.get_fallback_suggestions(previous_rooms, num_suggestions)
+                fallback_size = self.get_room_size(previous_rooms[-1])
+                return [(x, y, "Room", 0.5, float(max(0.0, fallback_size))) for (x, y) in fallback]
         
         # Fallback: continue pattern if 2+ rooms but model not trained
         elif len(previous_rooms) >= 2:
-            return self.get_fallback_suggestions(previous_rooms, num_suggestions)
+            fallback = self.get_fallback_suggestions(previous_rooms, num_suggestions)
+            fallback_size = self.get_room_size(previous_rooms[-1])
+            return [(x, y, "Room", 0.4, float(max(0.0, fallback_size))) for (x, y) in fallback]
         
         # Fallback: use median pattern if only 1 room
         elif len(self.patterns) > 0:
-            return self.get_fallback_suggestions(previous_rooms, num_suggestions)
+            fallback = self.get_fallback_suggestions(previous_rooms, num_suggestions)
+            fallback_size = self.get_room_size(previous_rooms[-1]) if previous_rooms else 0.0
+            if fallback_size <= 0:
+                size_targets = [p.get("target_size") for p in self.patterns if isinstance(p, dict) and p.get("target_size")]
+                if size_targets:
+                    size_targets.sort()
+                    fallback_size = float(size_targets[len(size_targets) // 2])
+            return [(x, y, "Room", 0.3, float(max(0.0, fallback_size))) for (x, y) in fallback]
         
         return []
     
@@ -463,8 +516,10 @@ class PatternLearner:
                             if isinstance(pattern["features"], dict):
                                 # Old format - skip invalid patterns
                                 continue
-                            elif isinstance(pattern["features"], list) and len(pattern["features"]) == 2:
-                                # New format - use as is
+                            elif isinstance(pattern["features"], list) and len(pattern["features"]) in (2, 3):
+                                feats = pattern["features"]
+                                if len(feats) == 2:
+                                    pattern["features"] = [feats[0], feats[1], 0.0]
                                 self.patterns.append(pattern)
                 
                 # Retrain model if we have enough patterns
@@ -506,8 +561,8 @@ class PatternLearner:
         """Get feature importance from trained models (for interpretability)."""
         if not self.is_trained:
             return None
-        
-        return {
+
+        importance = {
             "distance_importance": {
                 "distance": float(self.model_distance.feature_importances_[0]),
                 "direction": float(self.model_distance.feature_importances_[1]),
@@ -515,8 +570,20 @@ class PatternLearner:
             "direction_importance": {
                 "distance": float(self.model_direction.feature_importances_[0]),
                 "direction": float(self.model_direction.feature_importances_[1]),
-            }
+            },
         }
+        if self.model_distance.feature_importances_.shape[0] >= 3:
+            importance["distance_importance"]["size"] = float(self.model_distance.feature_importances_[2])
+        if self.model_direction.feature_importances_.shape[0] >= 3:
+            importance["direction_importance"]["size"] = float(self.model_direction.feature_importances_[2])
+        if self.model_size is not None and getattr(self.model_size, "feature_importances_", None) is not None:
+            imp = self.model_size.feature_importances_
+            importance["size_importance"] = {
+                "distance": float(imp[0]) if imp.shape[0] > 0 else 0.0,
+                "direction": float(imp[1]) if imp.shape[0] > 1 else 0.0,
+                "size": float(imp[2]) if imp.shape[0] > 2 else 0.0,
+            }
+        return importance
 
     def _to_tensor(self, arr):
         return torch.tensor(arr, dtype=torch.float32, device=self.dqn.device)
@@ -532,12 +599,16 @@ class PatternLearner:
         # Get predictions from all trees in the forest
         trees_dist = [tree.predict(features)[0] for tree in self.model_distance.estimators_]
         trees_dir = [tree.predict(features)[0] for tree in self.model_direction.estimators_]
+        trees_size = None
+        if self.model_size is not None:
+            trees_size = [tree.predict(features)[0] for tree in self.model_size.estimators_]
         
         # Calculate variance as uncertainty measure
         mean_dist = np.mean(trees_dist)
         mean_dir = np.mean(trees_dir)
         std_dist = np.std(trees_dist)
         std_dir = np.std(trees_dir)
+        std_size = np.std(trees_size) if trees_size is not None else None
         
         # Normalize confidence: lower std = higher confidence
         # For distance: normalize by mean (coefficient of variation)
@@ -550,6 +621,13 @@ class PatternLearner:
         conf_direction = 1.0 - min(1.0, std_dir / 180.0)
         
         # Average confidence
+        if std_size is not None and trees_size is not None:
+            mean_size = np.mean(trees_size)
+            if mean_size > 1e-8:
+                conf_size = 1.0 - min(1.0, std_size / mean_size)
+            else:
+                conf_size = 0.5
+            return (conf_distance + conf_direction + conf_size) / 3.0
         return (conf_distance + conf_direction) / 2.0
     
     def should_use_model(self, features: np.ndarray) -> bool:
@@ -563,13 +641,20 @@ class PatternLearner:
         # Check if input features are within training range
         training_distances = [p["features"][0] for p in self.patterns]
         training_directions = [p["features"][1] for p in self.patterns]
+        training_sizes = [p["features"][2] for p in self.patterns if isinstance(p.get("features"), list) and len(p["features"]) >= 3 and p["features"][2] > 0]
         
         training_ranges = {
             'distance': (min(training_distances), max(training_distances)),
             'direction': (min(training_directions), max(training_directions))
         }
+        if training_sizes:
+            training_ranges['size'] = (min(training_sizes), max(training_sizes))
         
-        feat_distance, feat_direction = features[0]
+        if features.shape[1] >= 3:
+            feat_distance, feat_direction, feat_size = features[0]
+        else:
+            feat_distance, feat_direction = features[0]
+            feat_size = 0.0
         
         # Check if within training range (with small margin for generalization)
         margin_factor = 0.1  # 10% margin
@@ -583,9 +668,15 @@ class PatternLearner:
                             dist_range[1] + dist_margin)
         in_direction_range = (dir_range[0] - dir_margin <= feat_direction <= 
                              dir_range[1] + dir_margin)
+
+        in_size_range = True
+        if 'size' in training_ranges and feat_size > 0:
+            size_range = training_ranges['size']
+            size_margin = (size_range[1] - size_range[0]) * margin_factor
+            in_size_range = (size_range[0] - size_margin <= feat_size <= size_range[1] + size_margin)
         
         # Also check confidence
         confidence = self.get_prediction_confidence(features)
         min_confidence = 0.3  # Minimum confidence threshold
         
-        return in_distance_range and in_direction_range and confidence >= min_confidence
+        return in_distance_range and in_direction_range and in_size_range and confidence >= min_confidence

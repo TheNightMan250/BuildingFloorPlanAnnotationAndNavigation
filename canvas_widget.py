@@ -100,7 +100,15 @@ class PolygonSuggestionItem(QGraphicsPolygonItem):
 class PatternSuggestionMarker(QGraphicsRectItem):
     """Marker for pattern-based room position suggestions with variable size."""
 
-    def __init__(self, x: float, y: float, size: float = 20.0, room_type: str = "Room", confidence: float = 1.0):
+    def __init__(
+        self,
+        x: float,
+        y: float,
+        size: float = 20.0,
+        room_type: str = "Room",
+        confidence: float = 1.0,
+        suggested_area: Optional[float] = None,
+    ):
         # Variable size based on room type and confidence
         base_size = self._get_size_for_room_type(room_type)
         adjusted_size = base_size * (0.7 + 0.6 * confidence)  # Scale by confidence (0.7x to 1.3x)
@@ -117,6 +125,12 @@ class PatternSuggestionMarker(QGraphicsRectItem):
         self.suggestion_pos = (x, y)
         self.room_type = room_type
         self.confidence = confidence
+        self.suggested_area = suggested_area
+        self.room_half_size = None
+        if suggested_area is not None and suggested_area > 0:
+            side = suggested_area ** 0.5
+            side = max(20.0, min(200.0, side))
+            self.room_half_size = side / 2.0
 
         # Add tooltip for demo
         self.setToolTip(f"{room_type} (Confidence: {confidence:.1%})")
@@ -213,7 +227,7 @@ class FloorPlanCanvas(QGraphicsView):
         self.auto_complete = AutoCompleteEngine()
 
         # Pattern learning
-        self.pattern_learner = PatternLearner(demo_mode=True)
+        self.pattern_learner = PatternLearner(demo_mode=False)
         self.pattern_suggestion_markers = []  # List of PatternSuggestionMarker items
 
         # Room items
@@ -327,7 +341,7 @@ class FloorPlanCanvas(QGraphicsView):
             if self.current_tool == "select":
                 if isinstance(item, PatternSuggestionMarker):
                     x, y = item.suggestion_pos
-                    size = 50.0
+                    size = item.room_half_size if getattr(item, "room_half_size", None) is not None else 50.0
                     vertices = [
                         [x - size, y - size],
                         [x + size, y - size],
@@ -740,7 +754,18 @@ class FloorPlanCanvas(QGraphicsView):
         
         # Create enhanced markers for suggestions
         for suggestion in suggestions:
-            if len(suggestion) >= 4:  # (x, y, room_type, confidence)
+            if len(suggestion) >= 5:  # (x, y, room_type, confidence, suggested_area)
+                x, y, room_type, confidence, suggested_area = suggestion
+                marker = PatternSuggestionMarker(
+                    x,
+                    y,
+                    room_type=room_type,
+                    confidence=confidence,
+                    suggested_area=suggested_area,
+                )
+                self.scene.addItem(marker)
+                self.pattern_suggestion_markers.append(marker)
+            elif len(suggestion) >= 4:  # (x, y, room_type, confidence)
                 x, y, room_type, confidence = suggestion
                 marker = PatternSuggestionMarker(x, y, room_type=room_type, confidence=confidence)
                 self.scene.addItem(marker)

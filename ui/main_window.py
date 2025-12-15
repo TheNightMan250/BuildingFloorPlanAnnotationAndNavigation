@@ -582,6 +582,15 @@ class MainWindow(QMainWindow):
         )
     
     def closeEvent(self, event):
+        try:
+            if hasattr(self, "canvas") and hasattr(self.canvas, "pattern_learner"):
+                learner = self.canvas.pattern_learner
+                if getattr(learner, "demo_mode", False) is False and getattr(learner, "patterns", None) is not None:
+                    if len(learner.patterns) >= 5:
+                        learner.train_model()
+        except Exception:
+            pass
+
         self.db_session.close()
         event.accept()
 

@@ -96,7 +96,8 @@ class AutoCompleteEngine:
             verts = [r.get_vertices() for r in previous_rooms[-2:]]
             pat_suggestions = pattern_learner.suggest_positions(verts, num_suggestions=1)
             if pat_suggestions:
-                x, y = pat_suggestions[0]
+                first = pat_suggestions[0]
+                x, y = first[0], first[1]
                 pat_center = QPointF(x, y)
 
             # NN prediction using DQN
